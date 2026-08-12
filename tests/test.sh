@@ -33,6 +33,59 @@ test_static_and_cli() {
     pass "static checks and CLI/EOF handling"
 }
 
+test_size_parser() {
+    local lib
+    lib=$(mktemp /tmp/nft-forward-lib.XXXXXX)
+    awk '/^check_root$/ {exit} {print}' "${SCRIPT}" > "$lib"
+    # shellcheck source=/dev/null
+    source "$lib"
+    rm -f "$lib"
+
+    [[ "$(parse_size_bytes 1K)" == 1024 ]]
+    [[ "$(parse_size_bytes 2MiB)" == 2097152 ]]
+    [[ "$(parse_size_bytes unlimited)" == 0 ]]
+    [[ "$(format_bytes 1073741824)" == '1.00 GiB' ]]
+    if parse_size_bytes 1.5G >/dev/null 2>&1; then fail "decimal size unexpectedly accepted"; fi
+    if parse_size_bytes 1XB >/dev/null 2>&1; then fail "unknown size unit unexpectedly accepted"; fi
+    pass "size parsing and formatting"
+}
+
+test_sysctl_config_update() {
+    local lib tmp
+    lib=$(mktemp /tmp/nft-forward-lib.XXXXXX)
+    tmp=$(mktemp /tmp/nft-forward-sysctl.XXXXXX)
+    awk '/^check_root$/ {exit} {print}' "${SCRIPT}" > "$lib"
+    # shellcheck source=/dev/null
+    source "$lib"
+    rm -f "$lib"
+
+    SYSCTL_CONF=$tmp
+    printf 'net.core.default_qdisc=fq_codel\n' > "$SYSCTL_CONF"
+    set_sysctl_conf net.core.default_qdisc fq
+    set_sysctl_conf net.ipv4.tcp_congestion_control bbr
+    set_sysctl_conf net.ipv4.tcp_congestion_control bbr
+    [[ "$(grep -c '^net.core.default_qdisc=fq$' "$SYSCTL_CONF")" == 1 ]]
+    [[ "$(grep -c '^net.ipv4.tcp_congestion_control=bbr$' "$SYSCTL_CONF")" == 1 ]]
+    rm -f "$tmp"
+    pass "sysctl config update and deduplication"
+}
+
+test_rule_selection_helpers() {
+    local lib
+    lib=$(mktemp /tmp/nft-forward-lib.XXXXXX)
+    awk '/^check_root$/ {exit} {print}' "${SCRIPT}" > "$lib"
+    # shellcheck source=/dev/null
+    source "$lib"
+    rm -f "$lib"
+
+    RULES=('1000|192.0.2.1|2000|one|0|auto' '1001|192.0.2.2|2001|two|1024|eth0')
+    select_rule 'pick: ' <<< '2' >/dev/null
+    [[ "$SELECTED_INDEX" == 1 ]]
+    [[ "$SELECTED_RULE" == "${RULES[1]}" ]]
+    if select_rule 'pick: ' <<< '3' >/dev/null 2>&1; then fail "out-of-range rule selection accepted"; fi
+    pass "rule selection helpers"
+}
+
 test_namespace_runtime() {
     command -v unshare >/dev/null 2>&1 || fail "unshare is required"
     command -v nft >/dev/null 2>&1 || fail "nft is required"
@@ -101,6 +154,9 @@ nft list table inet port_forward_meter | grep -q 'counter download_12345'
 upload_line=$(nft -a list chain inet port_forward_meter forward_meter | awk '/counter name "upload_12345"/ {print NR; exit}')
 quota_line=$(nft -a list chain inet port_forward_meter forward_meter | awk '/quota name "monthly_12345" drop/ {print NR; exit}')
 [[ -n "$upload_line" && -n "$quota_line" && "$upload_line" -lt "$quota_line" ]]
+[[ "$(nft list chain inet port_forward_meter forward_meter | awk '/counter name "upload_12345"/ {n++} END {print n+0}')" == 2 ]]
+[[ "$(nft list chain inet port_forward_meter forward_meter | awk '/counter name "download_12345"/ {n++} END {print n+0}')" == 2 ]]
+[[ "$(nft list chain inet port_forward_meter forward_meter | awk '/quota name "monthly_12345" drop/ {n++} END {print n+0}')" == 4 ]]
 
 "${SCRIPT}" --traffic >/tmp/nft-forward-runtime-traffic.out
 grep -q '12345' /tmp/nft-forward-runtime-traffic.out
@@ -291,6 +347,9 @@ NS
 }
 
 test_static_and_cli
+test_size_parser
+test_sysctl_config_update
+test_rule_selection_helpers
 test_namespace_runtime
 test_real_forwarding_and_quota
 echo "ALL TESTS PASSED"

@@ -198,4 +198,4 @@ nft-forward --help
 sudo ./tests/test.sh
 ```
 
-测试覆盖 Bash 语法、ShellCheck、EOF/参数处理、配置生成、按端口 counter/quota、自动网卡识别、真实 DNAT/SNAT 数据传输、额度累计，以及重置后恢复转发。GitHub Actions 会在每次 push 和 pull request 时执行同一套测试。
+测试覆盖 Bash 语法、ShellCheck、EOF/参数处理、流量单位解析、sysctl 配置去重、配置生成、按端口 counter/quota、自动网卡识别、真实 DNAT/SNAT 数据传输、额度累计，以及重置后恢复转发。GitHub Actions 会在每次 push 和 pull request 时执行同一套测试。

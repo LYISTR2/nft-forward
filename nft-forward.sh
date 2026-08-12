@@ -22,6 +22,8 @@ SCRIPT_URL="https://raw.githubusercontent.com/LYISTR2/nft-forward/main/nft-forwa
 
 # 规则格式: 本机端口|目标IP|目标端口|备注|月流量限制字节(0=不限)|入站网卡(auto=自动)
 declare -a RULES=()
+SELECTED_INDEX=-1
+SELECTED_RULE=""
 
 # ============== 日志与输出 ==============
 log_action() {
@@ -75,31 +77,23 @@ sanitize_note() {
 }
 
 parse_size_bytes() {
-    local raw="${1:-}" number unit multiplier
+    local raw="${1:-}" number unit power=0
     raw="${raw//[[:space:]]/}"
     raw="${raw^^}"
     [[ -n "$raw" ]] || return 1
-    if [[ "$raw" == "0" || "$raw" == "NONE" || "$raw" == "UNLIMITED" ]]; then
-        echo 0
-        return 0
-    fi
-    if [[ ! "$raw" =~ ^([0-9]+)(B|K|KB|KIB|M|MB|MIB|G|GB|GIB|T|TB|TIB)?$ ]]; then
-        return 1
-    fi
+    [[ "$raw" =~ ^(0|NONE|UNLIMITED)$ ]] && { echo 0; return; }
+    [[ "$raw" =~ ^([0-9]+)(B|K|KB|KIB|M|MB|MIB|G|GB|GIB|T|TB|TIB)?$ ]] || return 1
     number="${BASH_REMATCH[1]}"
     unit="${BASH_REMATCH[2]:-B}"
     (( number > 0 )) || return 1
     case "$unit" in
-        B) multiplier=1 ;;
-        K|KB|KIB) multiplier=1024 ;;
-        M|MB|MIB) multiplier=$((1024 ** 2)) ;;
-        G|GB|GIB) multiplier=$((1024 ** 3)) ;;
-        T|TB|TIB) multiplier=$((1024 ** 4)) ;;
-        *) return 1 ;;
+        K|KB|KIB) power=1 ;;
+        M|MB|MIB) power=2 ;;
+        G|GB|GIB) power=3 ;;
+        T|TB|TIB) power=4 ;;
     esac
-    if (( number > 9223372036854775807 / multiplier )); then
-        return 1
-    fi
+    local multiplier=$((1024 ** power))
+    (( number <= 9223372036854775807 / multiplier )) || return 1
     echo $((number * multiplier))
 }
 
@@ -115,10 +109,10 @@ format_bytes() {
 
 # ============== 网卡与本机 IP ==============
 get_local_ip() {
-    local ip
-    ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1) || true
+    local ip=""
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}') || true
     [[ -n "$ip" ]] && { echo "$ip"; return; }
-    ip=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1) || true
+    ip=$(ip -o -4 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}') || true
     [[ -n "$ip" ]] && { echo "$ip"; return; }
     hostname -I 2>/dev/null | awk '{print $1}' || true
 }
@@ -131,9 +125,6 @@ get_default_iface() {
     [[ -n "$iface" ]] && echo "$iface"
 }
 
-iface_rx_bytes() { cat "/sys/class/net/$1/statistics/rx_bytes" 2>/dev/null || echo 0; }
-iface_tx_bytes() { cat "/sys/class/net/$1/statistics/tx_bytes" 2>/dev/null || echo 0; }
-
 show_iface_traffic() {
     local iface rx tx
     iface=$(get_default_iface)
@@ -141,8 +132,16 @@ show_iface_traffic() {
         warn "无法自动识别默认出口网卡。"
         return
     fi
-    rx=$(iface_rx_bytes "$iface")
-    tx=$(iface_tx_bytes "$iface")
+    if [[ -r "/sys/class/net/${iface}/statistics/rx_bytes" ]]; then
+        read -r rx < "/sys/class/net/${iface}/statistics/rx_bytes"
+    else
+        rx=0
+    fi
+    if [[ -r "/sys/class/net/${iface}/statistics/tx_bytes" ]]; then
+        read -r tx < "/sys/class/net/${iface}/statistics/tx_bytes"
+    else
+        tx=0
+    fi
     info "自动识别默认网卡: ${iface}"
     printf "  接收(RX): %s\n" "$(format_bytes "$rx")"
     printf "  发送(TX): %s\n" "$(format_bytes "$tx")"
@@ -263,6 +262,33 @@ check_port_conflict() {
     fi
 }
 
+load_rules_or_info() {
+    local message="${1:-当前没有端口转发规则。}"
+    load_rules
+    (( ${#RULES[@]} > 0 )) || { info "$message"; return 1; }
+}
+
+select_rule() {
+    local prompt="$1" choice
+    do_list_table
+    read -rp "$prompt" choice || return 1
+    [[ "$choice" == 0 || -z "$choice" ]] && return 1
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
+        err "无效序号。"
+        return 1
+    fi
+    SELECTED_INDEX=$((choice - 1))
+    SELECTED_RULE="${RULES[SELECTED_INDEX]}"
+}
+
+limit_text() {
+    if [[ "${1:-0}" == 0 ]]; then
+        echo 不限
+    else
+        format_bytes "$1"
+    fi
+}
+
 # ============== 配置读写 ==============
 get_conf_local_ip() {
     [[ -f "${CONF_FILE}" ]] || return
@@ -329,7 +355,7 @@ table ip ${TABLE_NAME} {
         type nat hook prerouting priority -100; policy accept;
 EOF
 
-    local rule lport dip dport note limit iface effective_iface iface_expr
+    local rule lport dip dport note limit iface effective_iface iface_expr proto direction address_field port_field counter_name
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport dip dport note limit iface <<< "$rule"
         limit="${limit:-0}"
@@ -359,10 +385,9 @@ EOF
 EOF
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport dip dport note limit iface <<< "$rule"
-        cat >> "${tmp_file}" <<EOF
-        ip daddr ${dip} tcp dport ${dport} ct status dnat snat to \$LOCAL_IP
-        ip daddr ${dip} udp dport ${dport} ct status dnat snat to \$LOCAL_IP
-EOF
+        for proto in tcp udp; do
+            echo "        ip daddr ${dip} ${proto} dport ${dport} ct status dnat snat to \$LOCAL_IP" >> "${tmp_file}"
+        done
     done
     cat >> "${tmp_file}" <<EOF
     }
@@ -393,19 +418,23 @@ EOF
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport dip dport note limit iface <<< "$rule"
         limit="${limit:-0}"
-        cat >> "${tmp_file}" <<EOF
-        ct status dnat ct direction original meta l4proto tcp ip daddr ${dip} tcp dport ${dport} counter name "upload_${lport}"
-        ct status dnat ct direction original meta l4proto udp ip daddr ${dip} udp dport ${dport} counter name "upload_${lport}"
-        ct status dnat ct direction reply meta l4proto tcp ip saddr ${dip} tcp sport ${dport} counter name "download_${lport}"
-        ct status dnat ct direction reply meta l4proto udp ip saddr ${dip} udp sport ${dport} counter name "download_${lport}"
-EOF
+        for direction in original reply; do
+            if [[ "$direction" == original ]]; then
+                address_field=daddr; port_field=dport; counter_name="upload_${lport}"
+            else
+                address_field=saddr; port_field=sport; counter_name="download_${lport}"
+            fi
+            for proto in tcp udp; do
+                echo "        ct status dnat ct direction ${direction} meta l4proto ${proto} ip ${address_field} ${dip} ${proto} ${port_field} ${dport} counter name \"${counter_name}\"" >> "${tmp_file}"
+            done
+        done
         if (( limit > 0 )); then
-            cat >> "${tmp_file}" <<EOF
-        ct status dnat meta l4proto tcp ip daddr ${dip} tcp dport ${dport} quota name "monthly_${lport}" drop
-        ct status dnat meta l4proto udp ip daddr ${dip} udp dport ${dport} quota name "monthly_${lport}" drop
-        ct status dnat meta l4proto tcp ip saddr ${dip} tcp sport ${dport} quota name "monthly_${lport}" drop
-        ct status dnat meta l4proto udp ip saddr ${dip} udp sport ${dport} quota name "monthly_${lport}" drop
-EOF
+            for direction in original reply; do
+                if [[ "$direction" == original ]]; then address_field=daddr; port_field=dport; else address_field=saddr; port_field=sport; fi
+                for proto in tcp udp; do
+                    echo "        ct status dnat meta l4proto ${proto} ip ${address_field} ${dip} ${proto} ${port_field} ${dport} quota name \"monthly_${lport}\" drop" >> "${tmp_file}"
+                done
+            done
         fi
     done
     cat >> "${tmp_file}" <<EOF
@@ -479,18 +508,38 @@ enable_ip_forward() {
     fi
 }
 
+set_sysctl_conf() {
+    local key="$1" value="$2" escaped=${1//./\\.}
+    if grep -qE "^[[:space:]]*${escaped}[[:space:]]*=" "${SYSCTL_CONF}" 2>/dev/null; then
+        sed -i -E "s|^[[:space:]]*${escaped}[[:space:]]*=.*|${key}=${value}|" "${SYSCTL_CONF}"
+    else
+        echo "${key}=${value}" >> "${SYSCTL_CONF}"
+    fi
+}
+
 enable_bbr_fq() {
     modprobe tcp_bbr 2>/dev/null || true
     grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || { warn "内核不支持 BBR，已跳过。"; return; }
     sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-    grep -qE '^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=' "${SYSCTL_CONF}" 2>/dev/null \
-        && sed -i -E 's|^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=.*|net.core.default_qdisc=fq|' "${SYSCTL_CONF}" \
-        || echo 'net.core.default_qdisc=fq' >> "${SYSCTL_CONF}"
-    grep -qE '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=' "${SYSCTL_CONF}" 2>/dev/null \
-        && sed -i -E 's|^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=.*|net.ipv4.tcp_congestion_control=bbr|' "${SYSCTL_CONF}" \
-        || echo 'net.ipv4.tcp_congestion_control=bbr' >> "${SYSCTL_CONF}"
+    set_sysctl_conf net.core.default_qdisc fq
+    set_sysctl_conf net.ipv4.tcp_congestion_control bbr
     info "已尝试开启并持久化 BBR + fq。"
+}
+
+download_script() {
+    local tmp
+    tmp=$(mktemp /tmp/nft-forward-install.XXXXXX) || return 1
+    if command -v curl &>/dev/null && curl -fsSL "$SCRIPT_URL" -o "$tmp"; then
+        echo "$tmp"
+        return
+    fi
+    if command -v wget &>/dev/null && wget -qO "$tmp" "$SCRIPT_URL"; then
+        echo "$tmp"
+        return
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 install_reset_timer() {
@@ -498,18 +547,12 @@ install_reset_timer() {
     local source_path="${BASH_SOURCE[0]}" download_tmp=""
     if [[ -f "$source_path" && -r "$source_path" && "$source_path" != /dev/fd/* && "$source_path" != /proc/*/fd/* ]]; then
         install -m 0755 "$source_path" "${LOCAL_BIN}" 2>/dev/null || true
-    elif command -v curl &>/dev/null; then
-        download_tmp=$(mktemp /tmp/nft-forward-install.XXXXXX)
-        if curl -fsSL "$SCRIPT_URL" -o "$download_tmp" && bash -n "$download_tmp"; then
+    else
+        download_tmp=$(download_script) || true
+        if [[ -n "$download_tmp" ]] && bash -n "$download_tmp"; then
             install -m 0755 "$download_tmp" "${LOCAL_BIN}" 2>/dev/null || true
         fi
-        rm -f "$download_tmp"
-    elif command -v wget &>/dev/null; then
-        download_tmp=$(mktemp /tmp/nft-forward-install.XXXXXX)
-        if wget -qO "$download_tmp" "$SCRIPT_URL" && bash -n "$download_tmp"; then
-            install -m 0755 "$download_tmp" "${LOCAL_BIN}" 2>/dev/null || true
-        fi
-        rm -f "$download_tmp"
+        [[ -n "$download_tmp" ]] && rm -f "$download_tmp"
     fi
     [[ -x "${LOCAL_BIN}" ]] || { warn "无法安装 ${LOCAL_BIN}，月度重置定时器未启用。"; return 1; }
     cat > "/etc/systemd/system/${SERVICE_NAME}" <<EOF
@@ -599,7 +642,7 @@ show_traffic() {
         display_iface="$iface"
         [[ "$display_iface" == auto ]] && display_iface="auto:$(get_default_iface)"
         local limit_text
-        if [[ "$limit" == 0 ]]; then limit_text=不限; else limit_text=$(format_bytes "$limit"); fi
+        limit_text=$(limit_text "$limit")
         printf "%-8s %-18s %-14s %-14s %-14s %-14s %-8s %-12s\n" \
             "$lport" "${dip}:${dport}" "$(format_bytes "$upload")" "$(format_bytes "$download")" \
             "$(format_bytes "$total")" "$limit_text" "$status" "$display_iface"
@@ -623,50 +666,32 @@ reset_traffic() {
 }
 
 configure_limit() {
-    load_rules
-    [[ ${#RULES[@]} -gt 0 ]] || { info "当前没有端口转发规则。"; return; }
-    do_list_table
-    local choice raw bytes rule lport dip dport note limit iface
-    read -rp "请输入要设置流量限制的序号 (0 取消): " choice || return
-    [[ "$choice" == 0 || -z "$choice" ]] && return
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
-        err "无效序号。"
-        return
-    fi
+    load_rules_or_info || return
+    select_rule "请输入要设置流量限制的序号 (0 取消): " || return
+    local raw bytes lport dip dport note limit iface
     read -rp "请输入每月流量限制（如 500G、2T；0 表示不限）: " raw || return
     bytes=$(parse_size_bytes "$raw") || { err "流量格式无效。"; return; }
-    rule="${RULES[choice-1]}"
-    IFS='|' read -r lport dip dport note limit iface <<< "$rule"
+    IFS='|' read -r lport dip dport note limit iface <<< "$SELECTED_RULE"
     backup_conf
-    RULES[choice-1]="${lport}|${dip}|${dport}|${note}|${bytes}|${iface:-auto}"
+    RULES[SELECTED_INDEX]="${lport}|${dip}|${dport}|${note}|${bytes}|${iface:-auto}"
     if write_conf_file && reload_rules; then
         install_reset_timer || true
-        local limit_text
-        if [[ "$bytes" == 0 ]]; then limit_text=不限; else limit_text=$(format_bytes "$bytes"); fi
-        info "端口 ${lport} 月流量限制已设置为: ${limit_text}"
+        info "端口 ${lport} 月流量限制已设置为: $(limit_text "$bytes")"
         warn "重新生成规则会从 0 开始统计该端口本月流量。"
         log_action "设置流量限制: 端口 ${lport} 限额 ${bytes} 字节"
     fi
 }
 
 configure_iface() {
-    load_rules
-    [[ ${#RULES[@]} -gt 0 ]] || { info "当前没有端口转发规则。"; return; }
-    do_list_table
-    local choice iface rule lport dip dport note limit _old_iface
-    read -rp "请输入要设置入站网卡的序号 (0 取消): " choice || return
-    [[ "$choice" == 0 || -z "$choice" ]] && return
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
-        err "无效序号。"
-        return
-    fi
+    load_rules_or_info || return
+    select_rule "请输入要设置入站网卡的序号 (0 取消): " || return
+    local iface lport dip dport note limit _old_iface
     read -rp "输入网卡名（auto 自动识别，当前默认: $(get_default_iface)）: " iface || return
     iface="${iface:-auto}"
     validate_iface "$iface" || { err "网卡不存在或名称无效。"; return; }
-    rule="${RULES[choice-1]}"
-    IFS='|' read -r lport dip dport note limit _old_iface <<< "$rule"
+    IFS='|' read -r lport dip dport note limit _old_iface <<< "$SELECTED_RULE"
     backup_conf
-    RULES[choice-1]="${lport}|${dip}|${dport}|${note}|${limit:-0}|${iface}"
+    RULES[SELECTED_INDEX]="${lport}|${dip}|${dport}|${note}|${limit:-0}|${iface}"
     if write_conf_file && reload_rules; then
         info "端口 ${lport} 入站网卡已设置为 ${iface}。"
         log_action "设置入站网卡: 端口 ${lport} 网卡 ${iface}"
@@ -742,7 +767,7 @@ do_list_table() {
         IFS='|' read -r lport dip dport note limit iface <<< "$rule"
         limit="${limit:-0}"
         iface="${iface:-auto}"
-        if [[ "$limit" == 0 ]]; then limit_text=不限; else limit_text=$(format_bytes "$limit"); fi
+        limit_text=$(limit_text "$limit")
         printf "%-6s %-10s %-22s %-16s %-12s %s\n" "$idx" "$lport" "${dip}:${dport}" "$limit_text" "$iface" "${note:--}"
         ((idx++))
     done
@@ -750,28 +775,19 @@ do_list_table() {
 
 do_list() {
     echo ""
-    load_rules
-    [[ ${#RULES[@]} -gt 0 ]] || { info "当前没有端口转发规则。"; return; }
+    load_rules_or_info || return
     do_list_table
 }
 
 edit_rule_note() {
-    load_rules
-    [[ ${#RULES[@]} -gt 0 ]] || { info "当前没有端口转发规则。"; return; }
-    do_list_table
-    local choice rule lport dip dport _old_note limit iface note
-    read -rp "请输入要修改备注的序号 (0 取消): " choice || return
-    [[ "$choice" == 0 || -z "$choice" ]] && return
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
-        err "无效序号。"
-        return
-    fi
-    rule="${RULES[choice-1]}"
-    IFS='|' read -r lport dip dport _old_note limit iface <<< "$rule"
+    load_rules_or_info || return
+    select_rule "请输入要修改备注的序号 (0 取消): " || return
+    local lport dip dport _old_note limit iface note
+    IFS='|' read -r lport dip dport _old_note limit iface <<< "$SELECTED_RULE"
     read -rp "请输入新备注（留空清除）: " note || return
     note=$(sanitize_note "$note")
     backup_conf
-    RULES[choice-1]="${lport}|${dip}|${dport}|${note}|${limit:-0}|${iface:-auto}"
+    RULES[SELECTED_INDEX]="${lport}|${dip}|${dport}|${note}|${limit:-0}|${iface:-auto}"
     write_conf_file && reload_rules && info "备注已保存。"
 }
 
@@ -799,9 +815,7 @@ do_add() {
     read -rp "入站网卡 [默认 auto；可输入具体网卡名]: " iface || return
     iface="${iface:-auto}"
     validate_iface "$iface" || { err "网卡不存在或名称无效。"; return; }
-    local limit_text
-    if [[ "$limit" == 0 ]]; then limit_text=不限; else limit_text=$(format_bytes "$limit"); fi
-    echo "本机:${lport} (tcp+udp) → ${dip}:${dport}，月限额: ${limit_text}，网卡: ${iface}"
+    echo "本机:${lport} (tcp+udp) → ${dip}:${dport}，月限额: $(limit_text "$limit")，网卡: ${iface}"
     read -rp "确认添加？[Y/n]: " confirm || return
     [[ "$confirm" =~ ^[Nn]$ ]] && return
     backup_conf
@@ -816,22 +830,14 @@ do_add() {
 
 do_delete() {
     command -v nft &>/dev/null || { err "nftables 未安装。"; return; }
-    load_rules
-    [[ ${#RULES[@]} -gt 0 ]] || { info "当前没有规则。"; return; }
-    do_list_table
-    local choice confirm target lport dip dport note limit iface
-    read -rp "请输入要删除的序号 (0 取消): " choice || return
-    [[ "$choice" == 0 || -z "$choice" ]] && return
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
-        err "无效序号。"
-        return
-    fi
-    target="${RULES[choice-1]}"
-    IFS='|' read -r lport dip dport note limit iface <<< "$target"
+    load_rules_or_info "当前没有规则。" || return
+    select_rule "请输入要删除的序号 (0 取消): " || return
+    local confirm lport dip dport note limit iface
+    IFS='|' read -r lport dip dport note limit iface <<< "$SELECTED_RULE"
     read -rp "确认删除端口 ${lport}？[Y/n]: " confirm || return
     [[ "$confirm" =~ ^[Nn]$ ]] && return
     backup_conf
-    unset 'RULES[choice-1]'
+    unset 'RULES[SELECTED_INDEX]'
     RULES=("${RULES[@]}")
     if write_conf_file && reload_rules; then
         firewall_close_port "$lport" "$dip" "$dport"
@@ -840,8 +846,7 @@ do_delete() {
 }
 
 do_clear_all() {
-    load_rules
-    [[ ${#RULES[@]} -gt 0 ]] || { info "当前没有规则。"; return; }
+    load_rules_or_info "当前没有规则。" || return
     warn "即将清空全部 ${#RULES[@]} 条规则。"
     read -rp "确认清空？[y/N]: " confirm || return
     [[ "$confirm" =~ ^[Yy]$ ]] || return
