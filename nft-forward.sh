@@ -18,6 +18,7 @@ TABLE_NAME="port_forward"
 TIMER_NAME="nft-forward-reset.timer"
 SERVICE_NAME="nft-forward-reset.service"
 LOCAL_BIN="/usr/local/bin/nft-forward"
+SCRIPT_URL="https://raw.githubusercontent.com/LYISTR2/nft-forward/main/nft-forward.sh"
 
 # 规则格式: 本机端口|目标IP|目标端口|备注|月流量限制字节(0=不限)|入站网卡(auto=自动)
 declare -a RULES=()
@@ -489,8 +490,21 @@ enable_bbr_fq() {
 
 install_reset_timer() {
     command -v systemctl &>/dev/null || { warn "未找到 systemctl，无法安装月度重置定时器。"; return 1; }
-    if [[ -f "${BASH_SOURCE[0]}" && -r "${BASH_SOURCE[0]}" ]]; then
-        install -m 0755 "${BASH_SOURCE[0]}" "${LOCAL_BIN}" 2>/dev/null || true
+    local source_path="${BASH_SOURCE[0]}" download_tmp=""
+    if [[ -f "$source_path" && -r "$source_path" && "$source_path" != /dev/fd/* && "$source_path" != /proc/*/fd/* ]]; then
+        install -m 0755 "$source_path" "${LOCAL_BIN}" 2>/dev/null || true
+    elif command -v curl &>/dev/null; then
+        download_tmp=$(mktemp /tmp/nft-forward-install.XXXXXX)
+        if curl -fsSL "$SCRIPT_URL" -o "$download_tmp" && bash -n "$download_tmp"; then
+            install -m 0755 "$download_tmp" "${LOCAL_BIN}" 2>/dev/null || true
+        fi
+        rm -f "$download_tmp"
+    elif command -v wget &>/dev/null; then
+        download_tmp=$(mktemp /tmp/nft-forward-install.XXXXXX)
+        if wget -qO "$download_tmp" "$SCRIPT_URL" && bash -n "$download_tmp"; then
+            install -m 0755 "$download_tmp" "${LOCAL_BIN}" 2>/dev/null || true
+        fi
+        rm -f "$download_tmp"
     fi
     [[ -x "${LOCAL_BIN}" ]] || { warn "无法安装 ${LOCAL_BIN}，月度重置定时器未启用。"; return 1; }
     cat > "/etc/systemd/system/${SERVICE_NAME}" <<EOF

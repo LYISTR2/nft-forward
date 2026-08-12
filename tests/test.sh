@@ -157,6 +157,42 @@ PY
     grep -q 'Persistent=true' "${tmp}/etc/systemd/system/nft-forward-reset.timer"
     grep -q "ExecStart=${tmp}/nft-forward --reset-traffic --quiet" "${tmp}/etc/systemd/system/nft-forward-reset.service"
 
+    # Simulate bash <(curl ...): non-regular BASH_SOURCE must install through SCRIPT_URL.
+    mkdir -p "${tmp}/remote-bin" "${tmp}/remote-systemd"
+    cp "${SCRIPT}" "${tmp}/remote-source.sh"
+    cat > "${tmp}/remote-bin/curl" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+out=""
+while [[ \$# -gt 0 ]]; do
+    if [[ \$1 == -o ]]; then out=\$2; shift 2; else shift; fi
+done
+cp "${tmp}/remote-source.sh" "\$out"
+EOF
+    cat > "${tmp}/remote-bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "${tmp}/remote-bin/"*
+    cp "${SCRIPT}" "${tmp}/remote-run.sh"
+    python3 - "${tmp}/remote-run.sh" "${tmp}" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+tmp = sys.argv[2]
+s = path.read_text()
+s = s.replace('LOCAL_BIN="/usr/local/bin/nft-forward"', f'LOCAL_BIN="{tmp}/remote-installed"')
+s = s.replace('SCRIPT_URL="https://raw.githubusercontent.com/LYISTR2/nft-forward/main/nft-forward.sh"', f'SCRIPT_URL="file://{tmp}/remote-source.sh"')
+s = s.replace('cat > "/etc/systemd/system/${SERVICE_NAME}"', f'cat > "{tmp}/remote-systemd/${{SERVICE_NAME}}"')
+s = s.replace('cat > "/etc/systemd/system/${TIMER_NAME}"', f'cat > "{tmp}/remote-systemd/${{TIMER_NAME}}"')
+# Force the process-substitution branch without consuming a real pipe.
+s = s.replace('local source_path="${BASH_SOURCE[0]}" download_tmp=""', 'local source_path="/dev/fd/63" download_tmp=""')
+path.write_text(s)
+PY
+    PATH="${tmp}/remote-bin:/usr/bin:/bin" "${tmp}/remote-run.sh" --install-timer >/tmp/nft-forward-remote-timer.out
+    [[ -x "${tmp}/remote-installed" ]]
+    bash -n "${tmp}/remote-installed"
+
     pass "real nftables config, per-port counters/quota, auto interface and reset"
 }
 

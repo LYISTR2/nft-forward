@@ -106,6 +106,8 @@ nft-forward-reset.timer
 
 timer 使用 `Persistent=true`。如果服务器在重置时间关机，开机后会补执行一次。
 
+即使通过 `bash <(curl ...)` 临时运行，脚本也会在启用 timer 前把经过语法校验的当前版本安装到 `/usr/local/bin/nft-forward`。
+
 查看状态：
 
 ```bash
