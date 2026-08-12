@@ -189,3 +189,13 @@ nft-forward --help
 - `--traffic` 使用 Python 3 解析 `nft -j` 输出；安装流程会尝试安装 Python 3。
 - nftables 统计的是 IP 数据包字节数，不等同于应用层有效载荷，也可能与服务商控制台的链路层计费略有差异。
 - 若转发规则被其他工具整表覆盖，计数与 quota 会丢失，需要重新加载本项目配置。
+
+## 测试
+
+仓库包含隔离测试脚本，使用独立 network namespace 和真实 nftables，不会修改宿主机规则：
+
+```bash
+sudo ./tests/test.sh
+```
+
+测试覆盖 Bash 语法、ShellCheck、EOF/参数处理、配置生成、按端口 counter/quota、自动网卡识别、真实 DNAT/SNAT 数据传输、额度累计，以及重置后恢复转发。GitHub Actions 会在每次 push 和 pull request 时执行同一套测试。

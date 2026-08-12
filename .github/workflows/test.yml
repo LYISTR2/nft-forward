@@ -10,6 +10,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y nftables shellcheck iproute2
+        run: sudo apt-get update && sudo apt-get install -y nftables shellcheck iproute2 netcat-openbsd
       - name: Run isolated tests
         run: sudo ./tests/test.sh

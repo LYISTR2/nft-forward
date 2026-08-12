@@ -196,6 +196,99 @@ PY
     pass "real nftables config, per-port counters/quota, auto interface and reset"
 }
 
+test_real_forwarding_and_quota() {
+    command -v nc >/dev/null 2>&1 || fail "netcat is required"
+
+    unshare --net --mount bash -s <<'NS'
+set -Eeuo pipefail
+
+cleanup() {
+    kill "${server_pid:-}" >/dev/null 2>&1 || true
+    ip netns del client >/dev/null 2>&1 || true
+    ip netns del target >/dev/null 2>&1 || true
+    umount /run/netns >/dev/null 2>&1 || true
+    rm -rf /run/netns
+}
+trap cleanup EXIT
+
+mkdir -p /run/netns
+mount --bind /run/netns /run/netns
+mount --make-shared /run/netns
+ip netns add client
+ip netns add target
+
+ip link add fwd-client type veth peer name c-fwd
+ip link set c-fwd netns client
+ip addr add 10.10.0.1/24 dev fwd-client
+ip link set fwd-client up
+ip netns exec client ip addr add 10.10.0.2/24 dev c-fwd
+ip netns exec client ip link set c-fwd up
+ip netns exec client ip link set lo up
+ip netns exec client ip route add default via 10.10.0.1
+
+ip link add fwd-target type veth peer name t-fwd
+ip link set t-fwd netns target
+ip addr add 10.20.0.1/24 dev fwd-target
+ip link set fwd-target up
+ip netns exec target ip addr add 10.20.0.2/24 dev t-fwd
+ip netns exec target ip link set t-fwd up
+ip netns exec target ip link set lo up
+ip netns exec target ip route add default via 10.20.0.1
+
+sysctl -q -w net.ipv4.ip_forward=1
+
+ip netns exec target nc -l -k -p 23456 >/dev/null &
+server_pid=$!
+sleep 0.2
+
+nft -f - <<'NFT'
+table ip port_forward {
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+        iifname "fwd-client" tcp dport 12345 dnat to 10.20.0.2:23456
+    }
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        ip daddr 10.20.0.2 tcp dport 23456 ct status dnat snat to 10.20.0.1
+    }
+}
+table inet port_forward_meter {
+    counter upload_12345 { }
+    counter download_12345 { }
+    quota monthly_12345 { over 512 bytes }
+    chain forward_meter {
+        type filter hook forward priority -10; policy accept;
+        ct status dnat ct original proto-dst 12345 ct direction original counter name "upload_12345"
+        ct status dnat ct original proto-dst 12345 ct direction reply counter name "download_12345"
+        ct status dnat ct original proto-dst 12345 quota name "monthly_12345" drop
+    }
+}
+NFT
+
+# A small transfer passes and increments the upload counter/quota.
+head -c 64 /dev/zero | ip netns exec client nc -w 1 10.10.0.1 12345
+upload=$(nft -j list counter inet port_forward_meter upload_12345 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["counter"]["bytes"] for x in d["nftables"] if "counter" in x))')
+used=$(nft -j list quota inet port_forward_meter monthly_12345 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["quota"].get("used",0) for x in d["nftables"] if "quota" in x))')
+(( upload > 0 && used > 0 ))
+
+# Repeated traffic crosses the 512-byte quota; a later payload cannot reach target.
+for _ in 1 2 3 4; do head -c 256 /dev/zero | ip netns exec client nc -w 1 10.10.0.1 12345 || true; done
+used=$(nft -j list quota inet port_forward_meter monthly_12345 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["quota"].get("used",0) for x in d["nftables"] if "quota" in x))')
+(( used >= 512 ))
+
+nft reset counters table inet port_forward_meter >/dev/null
+nft reset quotas table inet port_forward_meter >/dev/null
+used=$(nft -j list quota inet port_forward_meter monthly_12345 | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["quota"].get("used",0) for x in d["nftables"] if "quota" in x))')
+[[ "$used" == 0 ]]
+
+# Reset restores forwarding immediately.
+head -c 32 /dev/zero | ip netns exec client nc -w 1 10.10.0.1 12345
+NS
+
+    pass "real DNAT/SNAT traffic increments quota and reset restores forwarding"
+}
+
 test_static_and_cli
 test_namespace_runtime
+test_real_forwarding_and_quota
 echo "ALL TESTS PASSED"
