@@ -394,12 +394,17 @@ EOF
         IFS='|' read -r lport dip dport note limit iface <<< "$rule"
         limit="${limit:-0}"
         cat >> "${tmp_file}" <<EOF
-        ct status dnat ct original proto-dst ${lport} ct direction original counter name "upload_${lport}"
-        ct status dnat ct original proto-dst ${lport} ct direction reply counter name "download_${lport}"
+        ct status dnat ct direction original meta l4proto tcp ip daddr ${dip} tcp dport ${dport} counter name "upload_${lport}"
+        ct status dnat ct direction original meta l4proto udp ip daddr ${dip} udp dport ${dport} counter name "upload_${lport}"
+        ct status dnat ct direction reply meta l4proto tcp ip saddr ${dip} tcp sport ${dport} counter name "download_${lport}"
+        ct status dnat ct direction reply meta l4proto udp ip saddr ${dip} udp sport ${dport} counter name "download_${lport}"
 EOF
         if (( limit > 0 )); then
             cat >> "${tmp_file}" <<EOF
-        ct status dnat ct original proto-dst ${lport} quota name "monthly_${lport}" drop
+        ct status dnat meta l4proto tcp ip daddr ${dip} tcp dport ${dport} quota name "monthly_${lport}" drop
+        ct status dnat meta l4proto udp ip daddr ${dip} udp dport ${dport} quota name "monthly_${lport}" drop
+        ct status dnat meta l4proto tcp ip saddr ${dip} tcp sport ${dport} quota name "monthly_${lport}" drop
+        ct status dnat meta l4proto udp ip saddr ${dip} udp sport ${dport} quota name "monthly_${lport}" drop
 EOF
         fi
     done

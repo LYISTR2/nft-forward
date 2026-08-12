@@ -98,8 +98,8 @@ nft list table ip port_forward | grep -q 'iifname "wan0" tcp dport 12345 dnat to
 nft list table inet port_forward_meter | grep -q 'quota monthly_12345'
 nft list table inet port_forward_meter | grep -q 'counter upload_12345'
 nft list table inet port_forward_meter | grep -q 'counter download_12345'
-upload_line=$(nft -a list chain inet port_forward_meter forward_meter | grep -n 'counter name "upload_12345"' | cut -d: -f1)
-quota_line=$(nft -a list chain inet port_forward_meter forward_meter | grep -n 'quota name "monthly_12345" drop' | cut -d: -f1)
+upload_line=$(nft -a list chain inet port_forward_meter forward_meter | awk '/counter name "upload_12345"/ {print NR; exit}')
+quota_line=$(nft -a list chain inet port_forward_meter forward_meter | awk '/quota name "monthly_12345" drop/ {print NR; exit}')
 [[ -n "$upload_line" && -n "$quota_line" && "$upload_line" -lt "$quota_line" ]]
 
 "${SCRIPT}" --traffic >/tmp/nft-forward-runtime-traffic.out
@@ -116,9 +116,10 @@ table inet port_forward_meter {
     quota monthly_12345 { over 1024 bytes used 1000 bytes }
     chain forward_meter {
         type filter hook forward priority -10; policy accept;
-        ct status dnat ct original proto-dst 12345 ct direction original counter name "upload_12345"
-        ct status dnat ct original proto-dst 12345 ct direction reply counter name "download_12345"
-        ct status dnat ct original proto-dst 12345 quota name "monthly_12345" drop
+        ct status dnat ct direction original meta l4proto tcp ip daddr 198.51.100.20 tcp dport 23456 counter name "upload_12345"
+        ct status dnat ct direction reply meta l4proto tcp ip saddr 198.51.100.20 tcp sport 23456 counter name "download_12345"
+        ct status dnat meta l4proto tcp ip daddr 198.51.100.20 tcp dport 23456 quota name "monthly_12345" drop
+        ct status dnat meta l4proto tcp ip saddr 198.51.100.20 tcp sport 23456 quota name "monthly_12345" drop
     }
 }
 NFT
@@ -258,9 +259,10 @@ table inet port_forward_meter {
     quota monthly_12345 { over 512 bytes }
     chain forward_meter {
         type filter hook forward priority -10; policy accept;
-        ct status dnat ct original proto-dst 12345 ct direction original counter name "upload_12345"
-        ct status dnat ct original proto-dst 12345 ct direction reply counter name "download_12345"
-        ct status dnat ct original proto-dst 12345 quota name "monthly_12345" drop
+        ct status dnat ct direction original meta l4proto tcp ip daddr 10.20.0.2 tcp dport 23456 counter name "upload_12345"
+        ct status dnat ct direction reply meta l4proto tcp ip saddr 10.20.0.2 tcp sport 23456 counter name "download_12345"
+        ct status dnat meta l4proto tcp ip daddr 10.20.0.2 tcp dport 23456 quota name "monthly_12345" drop
+        ct status dnat meta l4proto tcp ip saddr 10.20.0.2 tcp sport 23456 quota name "monthly_12345" drop
     }
 }
 NFT

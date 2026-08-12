@@ -57,7 +57,7 @@ nft-forward
 月流量 = 上传 + 下载
 ```
 
-统计位于 nftables `forward` hook，匹配 `ct status dnat` 和连接的原始目标端口，因此不会把目标服务器上相同端口的其他普通流量混入统计。
+统计位于 nftables `forward` hook，通过 `ct status dnat`、连接方向以及目标 IP/端口匹配每条转发。这样兼容 Debian 12 自带的 nftables 1.0.6，也不会把未经过本项目 DNAT 的普通流量混入统计。
 
 ## 流量限制
 
@@ -185,7 +185,7 @@ nft-forward --help
 - 每条规则同时创建 TCP 和 UDP 转发。
 - 菜单中的“安装 / 初始化 nftables”仍会接管并清空已有 nftables 配置；执行前会提示确认并备份配置文件。
 - 如果服务器同时启用了 firewalld、UFW 或 iptables，脚本会尝试放行对应端口。
-- 需要 nftables 支持 named counters、named quotas、`ct original proto-dst` 与 JSON 输出；建议使用较新的 Debian、Ubuntu、Rocky Linux 或 Arch Linux。
+- 需要 nftables 支持 named counters、named quotas、conntrack direction 与 JSON 输出；已实测兼容 Debian 12 的 nftables 1.0.6。
 - `--traffic` 使用 Python 3 解析 `nft -j` 输出；安装流程会尝试安装 Python 3。
 - nftables 统计的是 IP 数据包字节数，不等同于应用层有效载荷，也可能与服务商控制台的链路层计费略有差异。
 - 若转发规则被其他工具整表覆盖，计数与 quota 会丢失，需要重新加载本项目配置。
